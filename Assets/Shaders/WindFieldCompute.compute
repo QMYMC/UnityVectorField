@@ -1,0 +1,111 @@
+#pragma kernel InitParticles
+#pragma kernel UpdateParticles
+
+struct Particle { float3 position; float3 velocity; float physicalSpeed; float life; float seed; float stretch; };
+struct SpawnCell { float3 min; float cumulativeMeasure; float3 size; float padding; };
+RWStructuredBuffer<Particle> particles;
+StructuredBuffer<SpawnCell> _SpawnCells;
+StructuredBuffer<float> _XAxis, _YAxis, _ZAxis;
+Texture3D<float4> _FlowField;
+Texture2D<float4> _ColorRamp;
+int3 _GridSize;
+uint _ParticleCount;
+int _SpawnCount;
+float _CandidateMeasure;
+float3 _DataOrigin, _PositionScale;
+float _VelocityConversion, _DeltaTime, _SpeedMultiplier, _ParticleLifeTime, _Inertia;
+float _MinSpeed, _MaxSpeed, _ColorUnit, _MinVisibleSpeed;
+
+float Random(inout uint state) { state ^= state << 13; state ^= state >> 17; state ^= state << 5; return (state & 0x00ffffff) / 16777216.0; }
+float Coord(int axis, int index) { if (axis == 0) return _XAxis[index]; if (axis == 1) return _YAxis[index]; return _ZAxis[index]; }
+float GridIndex(int axis, float value)
+{
+    int count = _GridSize[axis];
+    if (count == 1) return 0;
+    int lo = 0, hi = count - 1;
+    [loop] while (hi - lo > 1) { int mid = (lo + hi) / 2; if (Coord(axis, mid) <= value) lo = mid; else hi = mid; }
+    return lo + saturate((value - Coord(axis, lo)) / (Coord(axis, lo + 1) - Coord(axis, lo)));
+}
+bool Sample(float3 position, out float3 physical)
+{
+    physical = 0;
+    float3 data = position / _PositionScale + _DataOrigin;
+    if (any(data < float3(_XAxis[0], _YAxis[0], _ZAxis[0]) - 1e-5) ||
+        any(data > float3(_XAxis[_GridSize.x-1], _YAxis[_GridSize.y-1], _ZAxis[_GridSize.z-1]) + 1e-5)) return false;
+    float3 index = float3(GridIndex(0, data.x), GridIndex(1, data.y), GridIndex(2, data.z));
+    int3 lo = min((int3)floor(index), max(_GridSize - 2, 0));
+    int3 hi = min(lo + 1, _GridSize - 1);
+    float3 t = index - lo;
+    float4 a = _FlowField.Load(int4(lo, 0));
+    float4 b = _FlowField.Load(int4(hi.x, lo.y, lo.z, 0));
+    float4 c = _FlowField.Load(int4(lo.x, hi.y, lo.z, 0));
+    float4 d = _FlowField.Load(int4(hi.x, hi.y, lo.z, 0));
+    float4 e = _FlowField.Load(int4(lo.x, lo.y, hi.z, 0));
+    float4 f = _FlowField.Load(int4(hi.x, lo.y, hi.z, 0));
+    float4 g = _FlowField.Load(int4(lo.x, hi.y, hi.z, 0));
+    float4 h = _FlowField.Load(int4(hi, 0));
+    if (min(min(min(a.a,b.a),min(c.a,d.a)),min(min(e.a,f.a),min(g.a,h.a))) < .5) return false;
+    physical = lerp(lerp(lerp(a.xyz,b.xyz,t.x),lerp(c.xyz,d.xyz,t.x),t.y),
+                    lerp(lerp(e.xyz,f.xyz,t.x),lerp(g.xyz,h.xyz,t.x),t.y),t.z);
+    return true;
+}
+bool Visible(float3 physical)
+{
+    float3 motion = physical * _PositionScale * _VelocityConversion;
+    if (_GridSize.y == 1) motion.y = 0;
+    float speed = length(physical);
+    float u = saturate((speed * _ColorUnit - _MinSpeed) / (_MaxSpeed - _MinSpeed)) * 255;
+    int lo = (int)floor(u);
+    float alpha = lerp(_ColorRamp.Load(int3(lo,0,0)).a, _ColorRamp.Load(int3(min(lo+1,255),0,0)).a, u-lo);
+    return length(motion) > 1e-6 && speed > max(1e-6, _MinVisibleSpeed * .5) && alpha > 0;
+}
+Particle Respawn(uint id, float seed)
+{
+    uint state = (id + 1) * 747796405u + (uint)(seed * 16777215) + 2891336453u;
+    Particle p = (Particle)0;
+    [loop] for (int attempt = 0; attempt < 32; attempt++)
+    {
+        float target = Random(state) * _CandidateMeasure;
+        int lo = 0, hi = _SpawnCount - 1;
+        [loop] while (lo < hi) { int mid = (lo+hi)/2; if (_SpawnCells[mid].cumulativeMeasure < target) lo = mid+1; else hi=mid; }
+        SpawnCell cell = _SpawnCells[lo];
+        p.position = cell.min + cell.size * float3(Random(state), Random(state), Random(state));
+        float3 physical;
+        if (Sample(p.position, physical) && Visible(physical))
+        {
+            p.velocity = physical * _PositionScale * _VelocityConversion;
+            if (_GridSize.y == 1) p.velocity.y = 0;
+            p.physicalSpeed = length(physical); p.stretch = p.physicalSpeed; p.life = 1;
+            break;
+        }
+    }
+    p.seed = Random(state);
+    return p;
+}
+[numthreads(64,1,1)]
+void InitParticles(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ParticleCount) return;
+    Particle p = Respawn(id.x, 0);
+    if (p.life > 0) p.life = max(.001, p.seed);
+    particles[id.x] = p;
+}
+[numthreads(64,1,1)]
+void UpdateParticles(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ParticleCount) return;
+    Particle p = particles[id.x];
+    p.life -= _DeltaTime / _ParticleLifeTime;
+    float3 physical;
+    if (p.life <= 0 || !Sample(p.position, physical) || !Visible(physical)) { particles[id.x] = Respawn(id.x, p.seed); return; }
+    p.physicalSpeed = length(physical);
+    float3 target = physical * _PositionScale * _VelocityConversion;
+    if (_GridSize.y == 1) target.y = 0;
+    p.velocity = lerp(p.velocity, target, 1 - pow(_Inertia, _DeltaTime * 60));
+    p.stretch = lerp(p.stretch, p.physicalSpeed, 1-pow(.85, _DeltaTime*60));
+    p.position += p.velocity * _SpeedMultiplier * _DeltaTime;
+    if (_GridSize.y == 1) p.position.y = (_YAxis[0] - _DataOrigin.y) * _PositionScale.y;
+    // Reject a step into a missing cell before it can be drawn.
+    if (!Sample(p.position, physical)) p = Respawn(id.x, p.seed);
+    particles[id.x] = p;
+}

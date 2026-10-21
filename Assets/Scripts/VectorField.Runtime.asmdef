@@ -1,0 +1,5 @@
+{
+  "name": "VectorField.Runtime",
+  "references": ["VectorField.Core"],
+  "autoReferenced": true
+}
